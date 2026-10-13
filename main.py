@@ -13,10 +13,29 @@ from scipy import stats
 from linearmodels.panel import PanelOLS
 import warnings
 warnings.filterwarnings('ignore')
+import os
 
-OUT_DIR = '.'
-MATPLOTLIB_NEW = tuple(map(int, matplotlib.__version__.split('.')[:2])) >= (3, 9)
-print(f"matplotlib: {matplotlib.__version__} | new API: {MATPLOTLIB_NEW}")
+# =============================================================================
+# OUTPUT DIRECTORY
+# =============================================================================
+
+OUT_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    'results'
+)
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+print(f"Output directory: {OUT_DIR}")
+
+MATPLOTLIB_NEW = tuple(
+    map(int, matplotlib.__version__.split('.')[:2])
+) >= (3, 9)
+
+print(
+    f"matplotlib: {matplotlib.__version__} | "
+    f"new API: {MATPLOTLIB_NEW}"
+)
 
 # =============================================================================
 # PART 0.1. IMPACT INDEX — USER-SPECIFIED
@@ -311,29 +330,89 @@ plt.savefig(f'{OUT_DIR}/region_trajectories.png', dpi=150); plt.close()
 
 # 2.5. Index distribution
 fig, ax = plt.subplots(figsize=(10, 6))
-groups = ['Control','Out','Treated']
-colors = {'Control':'#5C9E9A','Out':'#B0B0B0','Treated':'#C97B74'}
+
+groups = ['Control', 'Out', 'Treated']
+colors = {
+    'Control': '#5C9E9A',
+    'Out': '#B0B0B0',
+    'Treated': '#C97B74'
+}
+
 for grp in groups:
-    vals = impact[impact['group']==grp]['Index'].values
-    ax.scatter(vals, [groups.index(grp)]*len(vals), s=120,
-               color=colors[grp], alpha=0.75, edgecolor='black',
-               linewidth=0.5, label=grp)
+    vals = sorted(
+        impact.loc[impact['group'] == grp, 'Index'].dropna().values
+    )
+    y = groups.index(grp)
+
+    ax.scatter(
+        vals, [y] * len(vals),
+        s=120,
+        color=colors[grp],
+        alpha=0.75,
+        edgecolor='black',
+        linewidth=0.5,
+        label=grp,
+        zorder=3
+    )
+
+    # Рознесення підписів близьких точок
+    previous_v = None
+    stack = 0
+
     for v in vals:
-        ax.annotate(f'{v:.3f}', (v, groups.index(grp)),
-                    xytext=(0, 12), textcoords='offset points',
-                    ha='center', fontsize=8)
-ax.axvline(0.30, color='red', linestyle='--', alpha=0.6, label='Поріг Treated')
-ax.axvline(0.14, color='blue', linestyle='--', alpha=0.6, label='Поріг Control')
-ax.set_yticks(range(3)); ax.set_yticklabels(groups)
+        if previous_v is None or abs(v - previous_v) > 0.025:
+            stack = 0
+        else:
+            stack += 1
+
+        offset = 12 + (stack % 4) * 12
+
+        ax.annotate(
+            f'{v:.3f}',
+            (v, y),
+            xytext=(0, offset),
+            textcoords='offset points',
+            ha='center',
+            fontsize=8,
+            annotation_clip=False
+        )
+
+        previous_v = v
+
+# Зміщені пороги
+ax.axvline(
+    0.05, color='blue', linestyle='--',
+    linewidth=1.8, alpha=0.75,
+    label='Поріг Control'
+)
+
+ax.axvline(
+    0.2, color='red', linestyle='--',
+    linewidth=1.8, alpha=0.75,
+    label='Поріг Treated'
+)
+
+ax.set_yticks(range(3))
+ax.set_yticklabels(groups)
 ax.set_xlabel('Impact Index (2024)')
 ax.set_title('Розподіл областей за Impact Index', fontsize=12)
-ax.grid(alpha=0.3, axis='x'); ax.legend(loc='lower right')
+
+ax.grid(alpha=0.3, axis='x')
+ax.legend(loc='lower right')
+ax.margins(y=0.15)
+
 plt.tight_layout()
-plt.savefig(f'{OUT_DIR}/index_distribution.png', dpi=150); plt.close()
+plt.savefig(
+    f'{OUT_DIR}/index_distribution1.png',
+    dpi=150,
+    bbox_inches='tight'
+)
+plt.close()
 
 print("\n" + "=" * 80)
 print("GRAPHICS SAVED")
 print("=" * 80)
+
 
 # =============================================================================
 # PART 3. BINARY DiD (fixed — no clustering interactions)
@@ -407,6 +486,493 @@ plt.tight_layout()
 plt.savefig(f'{OUT_DIR}/event_study.png', dpi=150); plt.close()
 
 # =============================================================================
+# PART 4. FORMAL PARALLEL TRENDS TEST
+# =============================================================================
+#
+# Event-study model:
+#
+# Y_it = alpha_i + lambda_t
+#        + beta_2018 * Treated_i * D_2018
+#        + beta_2019 * Treated_i * D_2019
+#        + beta_2020 * Treated_i * D_2020
+#        + beta_2022 * Treated_i * D_2022
+#        + beta_2024 * Treated_i * D_2024
+#        + error_it
+#
+# Reference year = 2021
+#
+# Formal pre-trends test:
+#
+# H0: beta_2018 = beta_2019 = beta_2020 = 0
+#
+# IMPORTANT:
+# - використовується df, який створений вище;
+# - змінна panel НЕ використовується;
+# - joint test виконується через матричний Wald test;
+# - для subvention повний pre-trends test може бути неможливим,
+#   якщо недостатньо pre-treatment спостережень.
+# =============================================================================
+
+print("\n" + "=" * 80)
+print("FORMAL PARALLEL TRENDS TEST — ALL OUTCOMES")
+print("=" * 80)
+
+
+def run_parallel_trends(outcome):
+
+    print("\n" + "-" * 80)
+    print(OUTCOME_LABELS[outcome])
+    print("-" * 80)
+
+    # -------------------------------------------------------------------------
+    # 1. DATA
+    # -------------------------------------------------------------------------
+
+    d = df[
+        df["group"].isin(["Treated", "Control"])
+    ].copy()
+
+    d = d.dropna(subset=[outcome]).copy()
+
+    # -------------------------------------------------------------------------
+    # 2. EVENT-STUDY VARIABLES
+    # -------------------------------------------------------------------------
+
+    event_years = [2018, 2019, 2020, 2022, 2024]
+
+    for year in event_years:
+
+        d[f"treat_{year}"] = (
+            (d["year"] == year) &
+            (d["group"] == "Treated")
+        ).astype(float)
+
+    # -------------------------------------------------------------------------
+    # 3. PANEL INDEX
+    # -------------------------------------------------------------------------
+
+    d = d.set_index(["region", "year"])
+
+    exog_vars = [
+        "treat_2018",
+        "treat_2019",
+        "treat_2020",
+        "treat_2022",
+        "treat_2024"
+    ]
+
+    X = d[exog_vars]
+    y = d[outcome]
+
+    # -------------------------------------------------------------------------
+    # 4. EVENT-STUDY MODEL
+    # -------------------------------------------------------------------------
+
+    try:
+
+        model = PanelOLS(
+            y,
+            X,
+            entity_effects=True,
+            time_effects=True,
+            drop_absorbed=True
+        )
+
+        result = model.fit(
+            cov_type="clustered",
+            cluster_entity=True
+        )
+
+    except Exception as e:
+
+        print(
+            f"{outcome}: parallel trends model failed — {e}"
+        )
+
+        return None, None, []
+
+    # -------------------------------------------------------------------------
+    # 5. INDIVIDUAL EVENT-STUDY COEFFICIENTS
+    # -------------------------------------------------------------------------
+
+    rows = []
+
+    for year in event_years:
+
+        term = f"treat_{year}"
+
+        if term not in result.params.index:
+
+            print(
+                f"{year}: coefficient unavailable"
+            )
+
+            continue
+
+        beta = float(result.params[term])
+        se = float(result.std_errors[term])
+        tval = float(result.tstats[term])
+        pval = float(result.pvalues[term])
+
+        ci_low = beta - 1.96 * se
+        ci_high = beta + 1.96 * se
+
+        print(
+            f"{year}: "
+            f"coef={beta:+.4f}  "
+            f"SE={se:.4f}  "
+            f"t={tval:+.3f}  "
+            f"p={pval:.4f}  "
+            f"95% CI=[{ci_low:+.4f}; {ci_high:+.4f}]"
+        )
+
+        rows.append({
+            "outcome": outcome,
+            "year": year,
+            "reference_year": 2021,
+            "coef": beta,
+            "se": se,
+            "t": tval,
+            "p": pval,
+            "CI_low": ci_low,
+            "CI_high": ci_high
+        })
+
+    # -------------------------------------------------------------------------
+    # 6. JOINT PRE-TRENDS TEST
+    # -------------------------------------------------------------------------
+
+    pre_vars = [
+        "treat_2018",
+        "treat_2019",
+        "treat_2020"
+    ]
+
+    available_pre_vars = [
+        var
+        for var in pre_vars
+        if var in result.params.index
+    ]
+
+    if len(available_pre_vars) < 3:
+
+        print()
+        print(
+            "JOINT TEST: неможливо виконати."
+        )
+
+        print(
+            f"Доступно pre-treatment коефіцієнтів: "
+            f"{len(available_pre_vars)} з 3."
+        )
+
+        joint_result = {
+            "outcome": outcome,
+            "joint_test_stat": np.nan,
+            "joint_test_pvalue": np.nan,
+            "n_restrictions": len(available_pre_vars),
+            "status": "insufficient pre-treatment observations"
+        }
+
+        return result, joint_result, rows
+
+    # -------------------------------------------------------------------------
+    # 7. MATRIX WALD TEST
+    # -------------------------------------------------------------------------
+
+    try:
+
+        beta_vector = result.params.values
+        covariance = result.cov.values
+        parameter_names = list(result.params.index)
+
+        restriction_indices = [
+            parameter_names.index(var)
+            for var in available_pre_vars
+        ]
+
+        # R matrix
+        R = np.zeros(
+            (
+                len(restriction_indices),
+                len(beta_vector)
+            )
+        )
+
+        for row, idx in enumerate(restriction_indices):
+
+            R[row, idx] = 1.0
+
+        # Rβ
+        R_beta = R @ beta_vector
+
+        # RVR'
+        R_cov_R = R @ covariance @ R.T
+
+        # Numerical symmetrization
+        R_cov_R = (
+            R_cov_R +
+            R_cov_R.T
+        ) / 2
+
+        # Moore-Penrose inverse
+        R_cov_R_inv = np.linalg.pinv(R_cov_R)
+
+        # Wald statistic
+        joint_stat = float(
+            R_beta.T @
+            R_cov_R_inv @
+            R_beta
+        )
+
+        # Degrees of freedom
+        df_test = len(restriction_indices)
+
+        # Chi-square p-value
+        joint_pvalue = float(
+            stats.chi2.sf(
+                joint_stat,
+                df=df_test
+            )
+        )
+
+        print()
+        print("JOINT TEST OF PRE-TRENDS")
+        print("-" * 50)
+        print(
+            "H0: β2018 = β2019 = β2020 = 0"
+        )
+        print(
+            f"Wald χ² = {joint_stat:.4f}"
+        )
+        print(
+            f"df = {df_test}"
+        )
+        print(
+            f"p-value = {joint_pvalue:.4f}"
+        )
+
+        # ---------------------------------------------------------------------
+        # 8. INTERPRETATION
+        # ---------------------------------------------------------------------
+
+        if joint_pvalue > 0.05:
+
+            status = "parallel trends not rejected"
+
+            print(
+                "\n✓ H0 НЕ відхиляється "
+                f"(p = {joint_pvalue:.4f} > 0.05)."
+            )
+
+            print(
+                "Немає статистично значущих доказів "
+                "порушення паралельних передтрендів."
+            )
+
+        else:
+
+            status = "parallel trends rejected"
+
+            print(
+                "\n✗ H0 ВІДХИЛЯЄТЬСЯ "
+                f"(p = {joint_pvalue:.4f} < 0.05)."
+            )
+
+            print(
+                "Є статистично значущі докази "
+                "відмінностей між Treated і Control "
+                "до початку війни."
+            )
+
+        joint_result = {
+            "outcome": outcome,
+            "joint_test_stat": joint_stat,
+            "joint_test_pvalue": joint_pvalue,
+            "n_restrictions": df_test,
+            "status": status
+        }
+
+        return result, joint_result, rows
+
+    except Exception as e:
+
+        print()
+        print(
+            f"JOINT TEST FAILED: {e}"
+        )
+
+        joint_result = {
+            "outcome": outcome,
+            "joint_test_stat": np.nan,
+            "joint_test_pvalue": np.nan,
+            "n_restrictions": len(available_pre_vars),
+            "status": f"joint test failed: {e}"
+        }
+
+        return result, joint_result, rows
+
+
+# =============================================================================
+# 4.1. RUN FOR ALL OUTCOMES
+# =============================================================================
+
+parallel_results = []
+joint_results = []
+
+for outcome in OUTCOMES:
+
+    result, joint_result, rows = run_parallel_trends(
+        outcome
+    )
+
+    if joint_result is not None:
+        joint_results.append(joint_result)
+
+    if rows:
+        parallel_results.extend(rows)
+
+
+# =============================================================================
+# 4.2. EXPORT EVENT-STUDY RESULTS
+# =============================================================================
+
+parallel_results_df = pd.DataFrame(
+    parallel_results
+)
+
+parallel_results_df.to_csv(
+    os.path.join(
+        OUT_DIR,
+        "parallel_trends_event_study.csv"
+    ),
+    index=False,
+    encoding="utf-8-sig"
+)
+
+
+# =============================================================================
+# 4.3. EXPORT JOINT TEST RESULTS
+# =============================================================================
+
+joint_results_df = pd.DataFrame(
+    joint_results
+)
+
+joint_results_df.to_csv(
+    os.path.join(
+        OUT_DIR,
+        "parallel_trends_joint_test.csv"
+    ),
+    index=False,
+    encoding="utf-8-sig"
+)
+
+
+# =============================================================================
+# 4.4. SUMMARY
+# =============================================================================
+
+print("\n" + "=" * 80)
+print("SUMMARY — JOINT PARALLEL TRENDS TESTS")
+print("=" * 80)
+
+if len(joint_results_df) > 0:
+
+    print(
+        joint_results_df[
+            [
+                "outcome",
+                "joint_test_stat",
+                "n_restrictions",
+                "joint_test_pvalue",
+                "status"
+            ]
+        ]
+        .round(4)
+        .to_string(index=False)
+    )
+
+else:
+
+    print(
+        "Joint test results are unavailable."
+    )
+
+print("\nFiles saved:")
+print("  parallel_trends_event_study.csv")
+print("  parallel_trends_joint_test.csv")
+
+
+# =============================================================================
+# 4.5. EVENT-STUDY GRAPH WITH CONFIDENCE INTERVALS
+# =============================================================================
+
+fig, axes = plt.subplots(
+    2, 3,
+    figsize=(16, 9)
+)
+
+axes = axes.flatten()
+
+for i, outcome in enumerate(OUTCOMES):
+
+    ax = axes[i]
+
+    sub = parallel_results_df[
+        parallel_results_df["outcome"] == outcome
+    ].copy()
+
+    if len(sub) == 0:
+        ax.axis("off")
+        continue
+
+    ax.errorbar(
+        sub["year"],
+        sub["coef"],
+        yerr=[
+            sub["coef"] - sub["CI_low"],
+            sub["CI_high"] - sub["coef"]
+        ],
+        fmt="o",
+        capsize=4,
+        color="#C97B74"
+    )
+
+    ax.axhline(
+        0,
+        color="gray",
+        linestyle="--"
+    )
+
+    ax.axvline(
+        2021.5,
+        color="red",
+        linestyle="--",
+        alpha=0.5
+    )
+
+    ax.set_title(
+        f"Formal event study: {OUTCOME_LABELS[outcome]}",
+        fontsize=11
+    )
+
+    ax.set_xlabel("Рік")
+    ax.set_ylabel("Коефіцієнт")
+    ax.grid(alpha=0.3)
+
+axes[-1].axis("off")
+
+plt.tight_layout()
+
+plt.savefig(
+    f"{OUT_DIR}/formal_parallel_trends.png",
+    dpi=150
+)
+
+plt.close()
+
+# =============================================================================
 # PART 5. TREND-BREAK ANALYSIS (NEW)
 # Question: did the trend for SKB / n_schools INTENSIFY in Treated after war?
 # =============================================================================
@@ -469,58 +1035,82 @@ def get_slopes(outcome):
                 res[(grp, per)] = (np.nan, np.nan, np.nan)
     return res
 
-fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
-targets = ['n_schools', 'SKB', 'n_children']
+# =============================================================================
+# SLOPES BY GROUP/PERIOD
+# =============================================================================
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+axes = axes.flatten()   # ← перетворює 2D-масив на 1D, усуває помилку
+
+targets = ['n_schools', 'SKB', 'n_children', 'applications']
+
 for i, y in enumerate(targets):
     ax = axes[i]
     slopes = get_slopes(y)
+
     labels, vals, errs = [], [], []
-    for grp in ['Control','Treated']:
-        for per in ['Pre-war','War']:
+    for grp in ['Control', 'Treated']:
+        for per in ['Pre-war', 'War']:
             lab = f'{grp}\n{per}'
             labels.append(lab)
             vals.append(slopes[(grp, per)][0])
             errs.append(slopes[(grp, per)][1])
-    colors = ['#5C9E9A','#8DBCB8','#C97B74','#E8A6A0']
+
+    colors = ['#5C9E9A', '#8DBCB8', '#C97B74', '#E8A6A0']
     bars = ax.bar(labels, vals, yerr=errs, color=colors,
                   edgecolor='black', linewidth=0.6, capsize=4)
     ax.axhline(0, color='black', linewidth=0.8)
-    ax.set_title(f'Slope by group/period: {OUTCOME_LABELS[y]}', fontsize=11)
+    ax.set_title(f'Нахил тренду: {OUTCOME_LABELS[y]}', fontsize=11)
     ax.set_ylabel('Нахил тренду (од. на рік)')
     ax.grid(alpha=0.3, axis='y')
+
     for b, v in zip(bars, vals):
         if not np.isnan(v):
-            ax.text(b.get_x()+b.get_width()/2, v, f'{v:+.1f}',
-                    ha='center', va='bottom' if v>=0 else 'top', fontsize=9)
-plt.tight_layout()
-plt.savefig(f'{OUT_DIR}/slopes_by_group.png', dpi=150); plt.close()
+            ax.text(b.get_x() + b.get_width() / 2, v, f'{v:+.1f}',
+                    ha='center', va='bottom' if v >= 0 else 'top', fontsize=9)
 
-# Trend break plot (visual with fitted lines)
-fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+plt.tight_layout()
+plt.savefig(f'{OUT_DIR}/slopes_by_group.png', dpi=150)
+plt.close()
+
+
+# =============================================================================
+# TREND BREAK PLOT (visual with fitted lines)
+# =============================================================================
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+axes = axes.flatten()
+
 for i, y in enumerate(targets):
     ax = axes[i]
-    for grp, color in [('Control','#5C9E9A'), ('Treated','#C97B74')]:
-        sub = df[df['group']==grp]
+
+    for grp, color in [('Control', '#5C9E9A'), ('Treated', '#C97B74')]:
+        sub = df[df['group'] == grp]
+
         # Pre-war fit
-        pre_sub = sub[sub['year']<=2021][['year', y]].dropna()
+        pre_sub = sub[sub['year'] <= 2021][['year', y]].dropna()
         if len(pre_sub) > 2:
             s, ic, r, p, se = stats.linregress(pre_sub['year'], pre_sub[y])
             xs = np.linspace(2018, 2021, 10)
-            ax.plot(xs, ic + s*xs, color=color, linewidth=2.2,
+            ax.plot(xs, ic + s * xs, color=color, linewidth=2.2,
                     linestyle='-', label=f'{grp} (pre-war)')
+
         # War fit
-        war_sub = sub[sub['year']>=2022][['year', y]].dropna()
+        war_sub = sub[sub['year'] >= 2022][['year', y]].dropna()
         if len(war_sub) > 1:
             s2, ic2, r2, p2, se2 = stats.linregress(war_sub['year'], war_sub[y])
             xs = np.linspace(2022, 2024, 10)
-            ax.plot(xs, ic2 + s2*xs, color=color, linewidth=2.2,
+            ax.plot(xs, ic2 + s2 * xs, color=color, linewidth=2.2,
                     linestyle='--', label=f'{grp} (war)')
+
     ax.axvline(2021.5, color='red', linestyle=':', alpha=0.6)
     ax.set_title(OUTCOME_LABELS[y], fontsize=11)
-    ax.set_xlabel('Рік'); ax.set_ylabel(OUTCOME_LABELS[y])
-    ax.grid(alpha=0.3); ax.legend(fontsize=8, loc='best')
+    ax.set_xlabel('Рік')
+    ax.set_ylabel(OUTCOME_LABELS[y])
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8, loc='best')
+
 plt.tight_layout()
-plt.savefig(f'{OUT_DIR}/trend_break.png', dpi=150); plt.close()
+plt.savefig(f'{OUT_DIR}/trend_break.png', dpi=150)
+plt.close()
 
 # =============================================================================
 # PART 6. CONTINUOUS DiD
@@ -667,54 +1257,113 @@ for y in OUTCOMES:
         print(f"{y}: {e}")
 
 # =============================================================================
-# PART 9. EXPORT (SAFE)
+# PART 9. EXPORT
 # =============================================================================
+
 def collect(results_dict, label):
     rows = []
+
     for y, r in results_dict.items():
-        rows.append({'model': label, 'outcome': y,
-                     'coef': r.params.iloc[0],
-                     'se': r.std_errors.iloc[0],
-                     't': r.tstats.iloc[0],
-                     'p': r.pvalues.iloc[0],
-                     'n_obs': r.nobs})
+
+        if label == 'trend_break':
+            term = 'Treated_t_war'
+        elif label == 'binary':
+            term = 'did_bin'
+        elif label == 'continuous':
+            term = 'did_cont'
+        else:
+            term = r.params.index[0]
+
+        rows.append({
+            'model': label,
+            'outcome': y,
+            'term': term,
+            'coef': r.params[term],
+            'se': r.std_errors[term],
+            't': r.tstats[term],
+            'p': r.pvalues[term],
+            'n_obs': r.nobs
+        })
+
     return pd.DataFrame(rows)
 
-out = pd.concat([collect(binary_res, 'binary'),
-                 collect(cont_res,   'continuous'),
-                 collect(trend_res,  'trend_break')], ignore_index=True)
-out.to_csv(f'{OUT_DIR}/did_results.csv', index=False)
-impact.to_csv(f'{OUT_DIR}/impact_index.csv', index=False)
 
-# Trend break
+out = pd.concat([
+    collect(binary_res, 'binary'),
+    collect(cont_res, 'continuous'),
+    collect(trend_res, 'trend_break')
+], ignore_index=True)
+
+out.to_csv(
+    f'{OUT_DIR}/did_results.csv',
+    index=False,
+    encoding='utf-8-sig'
+)
+
+impact.to_csv(
+    f'{OUT_DIR}/impact_index.csv',
+    index=False,
+    encoding='utf-8-sig'
+)
+
+
+# =============================================================================
+# TREND-BREAK — ALL COEFFICIENTS
+# =============================================================================
+
 trend_rows = []
-for y, r in trend_res.items():
-    for name in ['t','t_war','Treated_t','Treated_t_war']:
-        trend_rows.append({
-            'outcome': y, 'term': name,
-            'coef': r.params[name], 'se': r.std_errors[name],
-            't': r.tstats[name], 'p': r.pvalues[name]
-        })
-pd.DataFrame(trend_rows).to_csv(f'{OUT_DIR}/trend_break_results.csv', index=False)
 
-# Wild bootstrap — safe check
+for y, r in trend_res.items():
+
+    for name in [
+        't',
+        't_war',
+        'Treated_t',
+        'Treated_t_war'
+    ]:
+
+        trend_rows.append({
+            'outcome': y,
+            'term': name,
+            'coef': r.params[name],
+            'se': r.std_errors[name],
+            't': r.tstats[name],
+            'p': r.pvalues[name]
+        })
+
+pd.DataFrame(trend_rows).to_csv(
+    f'{OUT_DIR}/trend_break_results.csv',
+    index=False,
+    encoding='utf-8-sig'
+)
+
+
+# =============================================================================
+# WILD BOOTSTRAP
+# =============================================================================
+
 if wild_results:
+
     wild_df = pd.DataFrame([
-        {'outcome': y, 't_obs': v[0], 'p_wild': v[1], 'se_boot': v[2]}
+        {
+            'outcome': y,
+            't_obs': v[0],
+            'p_wild': v[1],
+            'se_boot': v[2]
+        }
         for y, v in wild_results.items()
     ])
-    wild_df.to_csv(f'{OUT_DIR}/wild_bootstrap.csv', index=False)
-    print("  wild_bootstrap.csv saved")
-else:
-    print("  wild_bootstrap.csv — skipped (no results)")
 
-print("\n" + "=" * 80)
-print("FILES SAVED:")
-print("  did_results.csv, trend_break_results.csv,")
-print("  impact_index.csv, descriptive_stats.csv, change_by_group.csv,")
-print("  balancing_test.csv")
-print("  parallel_trends.png, boxplots_by_group.png, change_by_group.png,")
-print("  region_trajectories.png, index_distribution.png, event_study.png,")
-print("  slopes_by_group.png, trend_break.png")
-print("=" * 80)
-print("DONE.")
+    wild_df.to_csv(
+        f'{OUT_DIR}/wild_bootstrap.csv',
+        index=False,
+        encoding='utf-8-sig'
+    )
+
+    print("  wild_bootstrap.csv saved")
+
+else:
+
+    print(
+        "  wild_bootstrap.csv — skipped (no results)"
+    )
